@@ -1,27 +1,29 @@
 # Copyright (c) 2015-2019 Volodymyr Shymanskyy. See the file LICENSE for copying permission.
 
-_VERSION = "0.2.0"
+__version__ = "1.0.0"
 
 import struct
 import time
+import sys
 import os
 
 try:
     import machine
     gettime = lambda: time.ticks_ms()
+    SOCK_TIMEOUT = 0
 except ImportError:
     const = lambda x: x
     gettime = lambda: int(time.time() * 1000)
+    SOCK_TIMEOUT = 0.05
 
 def dummy(*args):
-    pass 
+    pass
 
 MSG_RSP = const(0)
 MSG_LOGIN = const(2)
 MSG_PING  = const(6)
 
 MSG_TWEET = const(12)
-MSG_EMAIL = const(13)
 MSG_NOTIFY = const(14)
 MSG_BRIDGE = const(15)
 MSG_HW_SYNC = const(16)
@@ -46,56 +48,43 @@ print("""
    / _ )/ /_ _____  / /__
   / _  / / // / _ \\/  '_/
  /____/_/\\_, /_//_/_/\\_\\
-        /___/ for Python v""" + _VERSION + " (" + os.uname()[0] + ")\n")
+        /___/ for Python v""" + __version__ + " (" + sys.platform + ")\n")
 
-class BlynkProtocol:
-    def __init__(self, auth, heartbeat=10, buffin=1024, log=None):
-        self.callbacks = {}
+class EventEmitter:
+    def __init__(self):
+        self._cbks = {}
+
+    def on(self, evt, f=None):
+        if f:
+            self._cbks[evt] = f
+        else:
+            def D(f):
+                self._cbks[evt] = f
+                return f
+            return D
+
+    def emit(self, evt, *a, **kv):
+        if evt in self._cbks:
+            self._cbks[evt](*a, **kv)
+
+
+class BlynkProtocol(EventEmitter):
+    def __init__(self, auth, tmpl_id=None, fw_ver=None, heartbeat=50, buffin=1024, log=None):
+        EventEmitter.__init__(self)
         self.heartbeat = heartbeat*1000
         self.buffin = buffin
         self.log = log or dummy
         self.auth = auth
+        self.tmpl_id = tmpl_id
+        self.fw_ver = fw_ver
         self.state = DISCONNECTED
         self.connect()
 
-    def ON(blynk, evt):
-        class Decorator:
-            def __init__(self, func):
-                self.func = func
-                blynk.callbacks[evt] = func
-            def __call__(self):
-                return self.func()
-        return Decorator
-
-    # These are mainly for backward-compatibility you can use "blynk.ON()" instead
-    def VIRTUAL_READ(blynk, pin):
-        class Decorator():
-            def __init__(self, func):
-                self.func = func
-                blynk.callbacks["readV"+str(pin)] = func
-            def __call__(self):
-                return self.func()
-        return Decorator
-
-    def VIRTUAL_WRITE(blynk, pin):
-        class Decorator():
-            def __init__(self, func):
-                self.func = func
-                blynk.callbacks["V"+str(pin)] = func
-            def __call__(self):
-                return self.func()
-        return Decorator
-
-    def on(self, evt, func):
-        self.callbacks[evt] = func
-
-    def emit(self, evt, *a, **kv):
-        self.log("Event:", evt, "->", *a)
-        if evt in self.callbacks:
-            self.callbacks[evt](*a, **kv)
-
     def virtual_write(self, pin, *val):
         self._send(MSG_HW, 'vw', pin, *val)
+
+    def send_internal(self, pin, *val):
+        self._send(MSG_INTERNAL,  pin, *val)
 
     def set_property(self, pin, prop, *val):
         self._send(MSG_PROPERTY, pin, prop, *val)
@@ -103,21 +92,12 @@ class BlynkProtocol:
     def sync_virtual(self, *pins):
         self._send(MSG_HW_SYNC, 'vr', *pins)
 
-    def notify(self, msg):
-        self._send(MSG_NOTIFY, msg)
-
-    def tweet(self, msg):
-        self._send(MSG_TWEET, msg)
-
-    def log_event(self, event, descr=None):
-        if descr==None:
-            self._send(MSG_EVENT_LOG, event)
-        else:
-            self._send(MSG_EVENT_LOG, event, descr)
+    def log_event(self, *val):
+        self._send(MSG_EVENT_LOG, *val)
 
     def _send(self, cmd, *args, **kwargs):
-        if "id" in kwargs:
-            id = kwargs.id
+        if 'id' in kwargs:
+            id = kwargs.get('id')
         else:
             id = self.msg_id
             self.msg_id += 1
@@ -146,10 +126,11 @@ class BlynkProtocol:
 
     def disconnect(self):
         if self.state == DISCONNECTED: return
+        self.bin = b""
         self.state = DISCONNECTED
         self.emit('disconnected')
 
-    def process(self, data=b''):
+    def process(self, data=None):
         if not (self.state == CONNECTING or self.state == CONNECTED): return
         now = gettime()
         if now - self.lastRecv > self.heartbeat+(self.heartbeat//2):
@@ -164,8 +145,9 @@ class BlynkProtocol:
             self.bin += data
 
         while True:
-            if len(self.bin) < 5: return
-            
+            if len(self.bin) < 5:
+                break
+
             cmd, i, dlen = struct.unpack("!BHH", self.bin[:5])
             if i == 0: return self.disconnect()
                       
@@ -178,22 +160,30 @@ class BlynkProtocol:
                     if dlen == STA_SUCCESS:
                         self.state = CONNECTED
                         dt = now - self.lastSend
-                        self._send(MSG_INTERNAL, 'ver', _VERSION, 'h-beat', self.heartbeat//1000, 'buff-in', self.buffin, 'dev', 'python')
+                        info = ['ver', __version__, 'h-beat', self.heartbeat//1000, 'buff-in', self.buffin, 'dev', sys.platform+'-py']
+                        if self.tmpl_id:
+                            info.extend(['tmpl', self.tmpl_id])
+                            info.extend(['fw-type', self.tmpl_id])
+                        if self.fw_ver:
+                            info.extend(['fw', self.fw_ver])
+                        self._send(MSG_INTERNAL, *info)
                         try:
                             self.emit('connected', ping=dt)
                         except TypeError:
                             self.emit('connected')
                     else:
                         if dlen == STA_INVALID_TOKEN:
+                            self.emit("invalid_auth")
                             print("Invalid auth token")
                         return self.disconnect()
             else:
                 if dlen >= self.buffin:
                     print("Cmd too big: ", dlen)
                     return self.disconnect()
-            
-                if len(self.bin) < 5+dlen: return
-                
+
+                if len(self.bin) < 5+dlen:
+                    break
+
                 data = self.bin[5:5+dlen]
                 self.bin = self.bin[5+dlen:]
 
@@ -206,11 +196,10 @@ class BlynkProtocol:
                     if args[0] == 'vw':
                         self.emit("V"+args[1], args[2:])
                         self.emit("V*", args[1], args[2:])
-                    elif args[0] == 'vr':
-                        self.emit("readV"+args[1])
-                        self.emit("readV*", args[1])
                 elif cmd == MSG_INTERNAL:
-                    self.emit("int_"+args[1], args[2:])
+                    self.emit("internal:"+args[0], args[1:])
+                elif cmd == MSG_REDIRECT:
+                    self.emit("redirect", args[0], int(args[1]))
                 else:
                     print("Unexpected command: ", cmd)
                     return self.disconnect()
@@ -219,35 +208,55 @@ import socket
 
 class Blynk(BlynkProtocol):
     def __init__(self, auth, **kwargs):
-        self.server = kwargs.pop('server', 'blynk-cloud.com')
-        self.port = kwargs.pop('port', 80)
+        self.insecure = kwargs.pop('insecure', False)
+        self.server = kwargs.pop('server', 'blynk.cloud')
+        self.port = kwargs.pop('port', 80 if self.insecure else 443)
         BlynkProtocol.__init__(self, auth, **kwargs)
+        self.on('redirect', self.redirect)
+
+    def redirect(self, server, port):
+        self.server = server
+        self.port = port
+        self.disconnect()
+        self.connect()
 
     def connect(self):
+        print('Connecting to %s:%d...' % (self.server, self.port))
+        s = socket.socket()
+        s.connect(socket.getaddrinfo(self.server, self.port)[0][-1])
         try:
-            self.conn = socket.socket()
-            self.conn.connect(socket.getaddrinfo(self.server, self.port)[0][4])
-            try:
-                self.conn.settimeout(eval('0.05'))
-            except:
-                self.conn.settimeout(0)
-            BlynkProtocol.connect(self)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except:
-            raise ValueError('Connection with the Blynk server %s:%d failed' % (self.server, self.port))
+            pass
+        if self.insecure:
+            self.conn = s
+        else:
+            try:
+                import ussl
+                ssl_context = ussl
+            except ImportError:
+                import ssl
+                ssl_context = ssl.create_default_context()
+            self.conn = ssl_context.wrap_socket(s, server_hostname=self.server)
+        try:
+            self.conn.settimeout(SOCK_TIMEOUT)
+        except:
+            s.settimeout(SOCK_TIMEOUT)
+        BlynkProtocol.connect(self)
 
     def _write(self, data):
-        #print('<', data.hex())
-        self.conn.send(data)
+        #print('<', data)
+        self.conn.write(data)
         # TODO: handle disconnect
 
     def run(self):
         data = b''
         try:
-            data = self.conn.recv(self.buffin)
-            #print('>', data.hex())
+            data = self.conn.read(self.buffin)
+            #print('>', data)
         except KeyboardInterrupt:
             raise
         except: # TODO: handle disconnect
-            pass
+            return
         self.process(data)
 
