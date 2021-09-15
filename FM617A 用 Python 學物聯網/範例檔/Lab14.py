@@ -2,6 +2,10 @@
 # 為了避免學習時遇到操作上的問題, 請從下面網址下載和手冊上一樣的版本：
 # https://github.com/thonny/thonny/releases/tag/v3.1.2
 
+# 這是搭配新的 Blynk IoT 版本的範例檔, 與舊版的 Blynk Legacy 不相容
+# 如果您仍在使用 Blynk Legacy 版本, 請至以下網址下載對應版本的範例檔：
+# https://github.com/FlagTech/FM617C/releases/tag/FM617D
+
 from machine import Pin
 import dht, BlynkLib, network              # 匯入 Blynk 模組
 from BlynkTimer import BlynkTimer
